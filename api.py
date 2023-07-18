@@ -112,7 +112,8 @@ class BirthDayField(DateField):
                 difference = datetime.datetime.now() - datetime.datetime.strptime(self._value, self._date_format)
                 age = difference.total_seconds() / self._seconds_in_year_approx
                 return 0 <= age <= 70
-        except:
+        except Exception as ex:
+            logging.exception(ex)
             return False
         return True
 
@@ -283,7 +284,8 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
         try:
             data_string = self.rfile.read(int(self.headers['Content-Length']))
             request = json.loads(data_string)
-        except:
+        except Exception as ex:
+            logging.exception(ex)
             code = BAD_REQUEST
 
         if request:
