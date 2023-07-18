@@ -73,8 +73,8 @@ class ArgumentsField(BaseField):
 
 class EmailField(BaseField):
     def is_valid(self) -> bool:
-        return BaseField.is_valid(self) and \
-            (self._value is None or self._value is not None and self._value.find("@") >= 0)
+        return BaseField.is_valid(self) and (
+                self._value is None or self._value is not None and self._value.find("@") >= 0)
 
 
 class PhoneField(BaseField):
@@ -102,19 +102,17 @@ class DateField(BaseField):
 
 
 class BirthDayField(DateField):
-    _seconds_in_year_approx = 365.25 * 24 * 3600
+    _SECONDS_IN_YEAR_APPROX = 365.25 * 24 * 3600
+    _MAX_AGE = 70
+    _MIN_AGE = 0
 
     def is_valid(self) -> bool:
         if not DateField.is_valid(self):
             return False
-        try:
-            if self._value is not None:
-                difference = datetime.datetime.now() - datetime.datetime.strptime(self._value, self._date_format)
-                age = difference.total_seconds() / self._seconds_in_year_approx
-                return 0 <= age <= 70
-        except Exception as ex:
-            logging.exception(ex)
-            return False
+        if self._value is not None:
+            difference = datetime.datetime.now() - datetime.datetime.strptime(self._value, self._date_format)
+            age = difference.total_seconds() / self._SECONDS_IN_YEAR_APPROX
+            return self._MIN_AGE <= age <= self._MAX_AGE
         return True
 
 
