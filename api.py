@@ -2,13 +2,17 @@
 # -*- coding: utf-8 -*-
 
 import abc
-import json
 import datetime
-import logging
 import hashlib
+import json
+import logging
+import traceback
+import typing as tp
 import uuid
-from optparse import OptionParser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from optparse import OptionParser
+
+import scoring as score
 
 SALT = "Otus"
 ADMIN_LOGIN = "admin"
@@ -36,77 +40,229 @@ GENDERS = {
 }
 
 
-class CharField(object):
-    pass
+class BaseField(abc.ABC):
+    def __init__(self, required=False, nullable=False):
+        self._required = required
+        self._nullable = nullable
+        self._value = None
+
+    def is_valid(self) -> bool:
+        return not self._required or self._nullable or not self._nullable and self._value is not None
+
+    @property
+    def get_value(self) -> tp.Any:
+        return self._value
+
+    def set_value(self, value: tp.Any):
+        self._value = value
 
 
-class ArgumentsField(object):
-    pass
+class CharField(BaseField):
+    def __str__(self):
+        return self.get_value if self.get_value is not None else ""
+
+    def is_valid(self) -> bool:
+        return BaseField.is_valid(self) and (self._value is None or isinstance(self._value, str))
 
 
-class EmailField(CharField):
-    pass
+class ArgumentsField(BaseField):
+    @property
+    def get_value(self) -> tp.Dict[str, tp.Any]:
+        return self._value
 
 
-class PhoneField(object):
-    pass
+class EmailField(BaseField):
+    def is_valid(self) -> bool:
+        return BaseField.is_valid(self) and \
+            (self._value is None or self._value is not None and self._value.find("@") >= 0)
 
 
-class DateField(object):
-    pass
+class PhoneField(BaseField):
+
+    def set_value(self, value: tp.Any):
+        self._value = str(value)
+
+    def is_valid(self) -> bool:
+        return BaseField.is_valid(self) and \
+            (self._value is None or self._value is not None and len(self._value) == 11 and self._value[0] == "7")
 
 
-class BirthDayField(object):
-    pass
+class DateField(BaseField):
+    _date_format = "%d.%m.%Y"  # формат даты DD.MM.YYYY
+
+    def is_valid(self) -> bool:
+        if not BaseField.is_valid(self):
+            return False
+        try:
+            if self._value is not None:
+                datetime.datetime.strptime(self._value, self._date_format)
+            return True
+        except ValueError:
+            return False
 
 
-class GenderField(object):
-    pass
+class BirthDayField(DateField):
+    _seconds_in_year_approx = 365.25 * 24 * 3600
+
+    def is_valid(self) -> bool:
+        if not DateField.is_valid(self):
+            return False
+        try:
+            if self._value is not None:
+                difference = datetime.datetime.now() - datetime.datetime.strptime(self._value, self._date_format)
+                age = difference.total_seconds() / self._seconds_in_year_approx
+                return 0 <= age <= 70
+        except:
+            return False
+        return True
 
 
-class ClientIDsField(object):
-    pass
+class GenderField(BaseField):
+    _allowed_genders = [0, 1, 2]
+
+    def is_valid(self) -> bool:
+        return BaseField.is_valid(self) and \
+            (self._value is None or self._value is not None and self._value in self._allowed_genders)
 
 
-class ClientsInterestsRequest(object):
-    client_ids = ClientIDsField(required=True)
-    date = DateField(required=False, nullable=True)
+class ClientIDsField(ArgumentsField):
+    def is_valid(self) -> bool:
+        return ArgumentsField.is_valid(self) and isinstance(self._value, list) and len(self._value) > 0 and all(
+            [isinstance(client_id, int) for client_id in self._value])
 
 
-class OnlineScoreRequest(object):
-    first_name = CharField(required=False, nullable=True)
-    last_name = CharField(required=False, nullable=True)
-    email = EmailField(required=False, nullable=True)
-    phone = PhoneField(required=False, nullable=True)
-    birthday = BirthDayField(required=False, nullable=True)
-    gender = GenderField(required=False, nullable=True)
+class BaseRequest:
+    def is_valid(self) -> bool:
+        for field in self.__dict__.values():
+            if isinstance(field, BaseField) and not field.is_valid():
+                return False
+        return True
+
+    def parse_request(self, request: tp.Dict[str, str]) -> None:
+        if not request:
+            return
+        for name, value in request.items():
+            if name not in self.__dict__.keys():
+                continue
+            field = self.__dict__[name]
+            if not isinstance(field, BaseField):
+                continue
+            field.set_value(value)
 
 
-class MethodRequest(object):
-    account = CharField(required=False, nullable=True)
-    login = CharField(required=True, nullable=True)
-    token = CharField(required=True, nullable=True)
-    arguments = ArgumentsField(required=True, nullable=True)
-    method = CharField(required=True, nullable=False)
+class ClientsInterestsRequest(BaseRequest):
+    _ERROR_INTEREST = {"error": "some field invalid"}
+
+    def __init__(self):
+        self.client_ids = ClientIDsField(required=True)
+        self.date = DateField(required=False, nullable=True)
+
+    def get_answer(self, request: tp.Dict[str, str], ctx: tp.Dict[str, tp.Any]) -> tp.Tuple[tp.Dict[str, tp.Any], int]:
+        self.parse_request(request)
+        if not self.is_valid():
+            return {"error": "some field invalid"}, INVALID_REQUEST
+        else:
+            interests = {client: score.get_interests(None, None) for client in self.client_ids.get_value}
+            ctx["nclients"] = len(interests)
+            return interests, OK
+
+
+class OnlineScoreRequest(BaseRequest):
+    _ADMIN_SCORE = {"score": 42}
+    _ERROR_SCORE = {"error": ""}
+
+    def __init__(self):
+        self.first_name = CharField(required=False, nullable=True)
+        self.last_name = CharField(required=False, nullable=True)
+        self.email = EmailField(required=False, nullable=True)
+        self.phone = PhoneField(required=False, nullable=True)
+        self.birthday = BirthDayField(required=False, nullable=True)
+        self.gender = GenderField(required=False, nullable=True)
+
+    def _phone_email_exists(self) -> bool:
+        return self.email.get_value is not None and self.phone.get_value is not None
+
+    def _first_last_names_exists(self) -> bool:
+        return self.first_name.get_value is not None and self.last_name.get_value is not None
+
+    def _gender_birthday_exists(self) -> bool:
+        return self.gender.get_value is not None and self.birthday.get_value is not None
+
+    def is_valid(self) -> bool:
+        if not BaseRequest.is_valid(self):
+            return False
+        return self._phone_email_exists() or self._first_last_names_exists() or self._gender_birthday_exists()
+
+    def get_answer(self, store, request: tp.Dict[str, str], is_admin: bool) -> tp.Tuple[tp.Dict[str, tp.Any], int]:
+        if is_admin:
+            return self._ADMIN_SCORE, OK
+        self.parse_request(request)
+        if not self.is_valid():
+            return self._ERROR_SCORE, INVALID_REQUEST
+        return {"score": score.get_score(store, self.phone.get_value, self.email.get_value, self.birthday.get_value,
+                                         self.gender.get_value, self.first_name, self.last_name)}, OK
+
+
+class MethodRequest(BaseRequest):
+    def __init__(self):
+        self.account = CharField(required=False, nullable=True)
+        self.login = CharField(required=True, nullable=True)
+        self.token = CharField(required=True, nullable=True)
+        self.arguments = ArgumentsField(required=True, nullable=True)
+        self.method = CharField(required=True, nullable=False)
 
     @property
     def is_admin(self):
-        return self.login == ADMIN_LOGIN
+        return self.login.get_value == ADMIN_LOGIN
 
 
-def check_auth(request):
+def check_auth(request: MethodRequest):
     if request.is_admin:
-        digest = hashlib.sha512(datetime.datetime.now().strftime("%Y%m%d%H") + ADMIN_SALT).hexdigest()
+        msg = datetime.datetime.now().strftime("%Y%m%d%H") + ADMIN_SALT
     else:
-        digest = hashlib.sha512(request.account + request.login + SALT).hexdigest()
-    if digest == request.token:
+        msg = str(request.account) + str(request.login) + SALT
+    digest = hashlib.sha512(msg.encode('utf-8')).hexdigest()
+    if digest == request.token.get_value:
         return True
     return False
 
 
-def method_handler(request, ctx, store):
-    response, code = None, None
-    return response, code
+def send_server_error_request() -> tp.Tuple[tp.Dict[str, str], int]:
+    return {"error": "Internal server error"}, INTERNAL_ERROR
+
+
+def send_invalid_request() -> tp.Tuple[tp.Dict[str, str], int]:
+    return {"error": "Invalid request"}, INVALID_REQUEST
+
+
+def send_invalid_auth_request() -> tp.Tuple[tp.Dict[str, str], int]:
+    return {"error": "Forbidden"}, FORBIDDEN
+
+
+def handle_method(request: tp.Dict[str, tp.Any], ctx: tp.Dict[str, tp.Any], store):
+    handler = MethodRequest()
+    handler.parse_request(request)
+    if not handler.is_valid():
+        return send_invalid_request()
+    if not check_auth(handler):
+        return send_invalid_auth_request()
+    if handler.method.get_value == "online_score":
+        ctx["has"] = handler.arguments.get_value
+        return OnlineScoreRequest().get_answer(store, handler.arguments.get_value, handler.is_admin)
+    elif handler.method.get_value == "clients_interests":
+        return ClientsInterestsRequest().get_answer(handler.arguments.get_value, ctx)
+    else:
+        return send_invalid_request()
+
+
+def method_handler(request: tp.Dict[str, tp.Dict[str, tp.Any]], ctx: tp.Dict[str, tp.Any], store):
+    try:
+        body = request.get("body", None)
+        return handle_method(body, ctx, store)
+    except Exception as ex:
+        print(ex)
+        traceback.print_exc()
+        return send_server_error_request()
 
 
 class MainHTTPHandler(BaseHTTPRequestHandler):
@@ -115,13 +271,15 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
     }
     store = None
 
-    def get_request_id(self, headers):
+    @staticmethod
+    def get_request_id(headers):
         return headers.get('HTTP_X_REQUEST_ID', uuid.uuid4().hex)
 
     def do_POST(self):
         response, code = {}, OK
         context = {"request_id": self.get_request_id(self.headers)}
         request = None
+        data_string = None
         try:
             data_string = self.rfile.read(int(self.headers['Content-Length']))
             request = json.loads(data_string)
@@ -134,7 +292,7 @@ class MainHTTPHandler(BaseHTTPRequestHandler):
             if path in self.router:
                 try:
                     response, code = self.router[path]({"body": request, "headers": self.headers}, context, self.store)
-                except Exception, e:
+                except Exception as e:
                     logging.exception("Unexpected error: %s" % e)
                     code = INTERNAL_ERROR
             else:
